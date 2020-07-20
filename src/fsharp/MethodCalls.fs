@@ -1173,6 +1173,15 @@ let AdjustCallerArgForOptional tcFieldInit eCallerMemberName (infoReader: InfoRe
         if isOptCallerArg then errorR(Error(FSComp.SR.tcFormalArgumentIsNotOptional(), m))
         assignedArg
 
+    // For non-nullable, non-optional arguments no conversion is needed.
+    // We return precisely the assignedArg.  This also covers the case where there
+    // can be a lingering permitted type mismatch between caller argument and called argument, 
+    // specifically caller can by `byref` and called `outref`.  No coercion is inserted in the
+    // expression tree in this case. 
+    | NotOptional when not (isNullableTy g calledArgTy) -> 
+        if isOptCallerArg then errorR(Error(FSComp.SR.tcFormalArgumentIsNotOptional(), m))
+        assignedArg
+
     | _ ->
 
         let callerArgExpr2 = 
@@ -1183,7 +1192,7 @@ let AdjustCallerArgForOptional tcFieldInit eCallerMemberName (infoReader: InfoRe
                 if isNullableTy g calledArgTy then 
                     MakeNullableExprIfNeeded infoReader calledArgTy callerArgTy callerArgExpr m
                 else
-                    callerArgExpr
+                    failwith "unreachable" // see case above
             
             | CallerSide dfltVal -> 
                 let calledArgTy = calledArg.CalledArgumentType
@@ -1840,6 +1849,7 @@ let GenWitnessExpr amap g m (traitInfo: TraitConstraintInfo) argExprs =
 
             | BuiltInSln -> 
                 Choice5Of5 ()
+
     match sln with
     | Choice1Of5(minfo, methArgTys) -> 
         let argExprs = 
@@ -1904,6 +1914,7 @@ let GenWitnessExpr amap g m (traitInfo: TraitConstraintInfo) argExprs =
                 Some (mkRecdFieldGetViaExprAddr (argExprs.[0], rfref, tinst, m))
             else 
                 Some (mkRecdFieldGet g (argExprs.[0], rfref, tinst, m))
+
         | _ -> None 
 
     | Choice3Of5 (anonInfo, tinst, i) -> 
@@ -1913,8 +1924,34 @@ let GenWitnessExpr amap g m (traitInfo: TraitConstraintInfo) argExprs =
         else 
             Some (mkAnonRecdFieldGet g (anonInfo, argExprs.[0], tinst, i, m))
 
-    | Choice4Of5 expr ->
+    | Choice4Of5 expr -> 
         Some (MakeApplicationAndBetaReduce g (expr, tyOfExpr g expr, [], argExprs, m))
 
-    | Choice5Of5 () ->
-        None
+    | Choice5Of5 () -> 
+        match traitInfo.Solution with 
+        | None -> None // the trait has been generalized
+        | Some _-> 
+        // For these operators, the witness is just a call to the coresponding FSharp.Core operator
+        match g.TryMakeOperatorAsBuiltInWitnessInfo isStringTy isArrayTy traitInfo argExprs with
+        | Some (info, tyargs, actualArgExprs) -> 
+            tryMkCallCoreFunctionAsBuiltInWitness g info tyargs actualArgExprs m
+        | None -> 
+            // For all other built-in operators, the witness is a call to the coresponding BuiltInWitnesses operator
+            // These are called as F# methods not F# functions
+            tryMkCallBuiltInWitness g traitInfo argExprs m
+        
+/// Generate a lambda expression for the given solved trait.
+let GenWitnessExprLambda amap g m (traitInfo: TraitConstraintInfo) =
+    let witnessInfo = traitInfo.TraitKey
+    let argtysl = GenWitnessArgTys g witnessInfo
+    let vse = argtysl |> List.mapiSquared (fun i j ty -> mkCompGenLocal m ("arg" + string i + "_" + string j) ty) 
+    let vsl = List.mapSquared fst vse
+    match GenWitnessExpr amap g m traitInfo (List.concat (List.mapSquared snd vse)) with 
+    | Some expr -> 
+        Choice2Of2 (mkMemberLambdas m [] None None vsl (expr, tyOfExpr g expr))
+    | None -> 
+        Choice1Of2 traitInfo
+
+/// Generate the arguments passed for a set of (solved) traits in non-generic code
+let GenWitnessArgs amap g m (traitInfos: TraitConstraintInfo list) =
+    [ for traitInfo in traitInfos -> GenWitnessExprLambda amap g m traitInfo ]
